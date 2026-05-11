@@ -101,12 +101,27 @@ local function catalogueFunction(fn, decompMap)
     -- their uses in the linear traversal. The fn.rpo list (built off the
     -- forward CFG) approximates this; non-block synthetic nodes (ENTRY/EXIT)
     -- are filtered out.
+    --
+    -- IMPORTANT: we propagate bindings along the dominator tree instead of
+    -- using a single flat map.  In loops the RPO puts the loop body *after*
+    -- blocks that follow the loop exit, so a flat map lets post-loop ALLOCs
+    -- leak into loop-body reads.  By inheriting from the immediate dominator
+    -- we guarantee a read only sees ALLOCs that actually dominate it.
     local order = fn.rpo or {}
     if #order == 0 then order = fn.blockIds end
-    local currentBinding = {}
+
+    local idom = fn.idom or {}
+    local bindingAtExit = {}  -- blockId -> binding map at end of block
 
     for _, blockId in ipairs(order) do
         local d = decompMap[blockId]
+        -- Inherit binding from immediate dominator.
+        local domId = idom[blockId]
+        local currentBinding = {}
+        if domId and bindingAtExit[domId] then
+            for k, v in pairs(bindingAtExit[domId]) do currentBinding[k] = v end
+        end
+
         if d then
             local lastAlloc = nil
             for i, st in ipairs(d.statements) do
@@ -189,6 +204,8 @@ local function catalogueFunction(fn, decompMap)
                 end)
             end
         end
+
+        bindingAtExit[blockId] = currentBinding
     end
 
     return info
