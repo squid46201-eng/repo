@@ -81,6 +81,11 @@ local function buildCtx(graph, structured, fn, parent)
         -- Registers we've decided to emit as locals at the function top.
         regsToDeclare = {},
         regSeen      = {},
+        -- Registers used as table bases without an in-function definition.
+        -- These are usually VM register-array locals declared before the
+        -- dispatcher loop (e.g. `local B_ = {}`), outside harvested blocks.
+        indexedBasesToInit = {},
+        indexedBaseSeen    = {},
         -- Track if the function uses ARG_READ (=> needs `local args = {...}`).
         usesArgs     = false,
         -- Track if the function references the ENV register (=> may need
@@ -114,6 +119,15 @@ function Ctx:noteWrite(reg)
     table.insert(self.regsToDeclare, reg)
 end
 
+function Ctx:noteIndexedBase(reg)
+    if not isReg(reg) then return end
+    if (reg.role or "GENERAL") ~= "GENERAL" then return end
+    local key = ("%s:%s"):format(tostring(reg.scope), tostring(reg.id))
+    if self.indexedBaseSeen[key] then return end
+    self.indexedBaseSeen[key] = true
+    table.insert(self.indexedBasesToInit, reg)
+end
+
 -- ---------------------------------------------------------------------------
 -- Walk the structured tree to compute which registers are written. This
 -- determines what we need to declare at the function top.
@@ -144,6 +158,9 @@ function Ctx:scanRegisters()
             self:noteWrite(s.target)
         elseif k == K.CALL then
             for _, t in ipairs(s.targets or {}) do self:noteWrite(t) end
+        end
+        if k == K.INDEX_READ or k == K.INDEX_WRITE then
+            self:noteIndexedBase(s.base)
         end
         if k == K.ARG_READ then self.usesArgs = true end
     end)
@@ -742,6 +759,15 @@ local function slotNamesForFn(graph, fn)
     return names
 end
 
+local function emitUndeclaredIndexedBaseInits(ctx, indent, w)
+    for _, r in ipairs(ctx.indexedBasesToInit or {}) do
+        local key = ("%s:%s"):format(tostring(r.scope), tostring(r.id))
+        if not ctx.regSeen[key] then
+            w(indent .. "local " .. regName(r) .. " = {}")
+        end
+    end
+end
+
 function M.functionLiteralText(graph, structured, entryId, parentFn, isVararg, upvalNames)
     local fn = structured.fns[entryId]
     if not fn then
@@ -784,6 +810,7 @@ function M.functionLiteralText(graph, structured, entryId, parentFn, isVararg, u
         end
         w(indentStr(1) .. "local " .. table.concat(names, ", "))
     end
+    emitUndeclaredIndexedBaseInits(ctx, indentStr(1), w)
 
     -- Hoist slot ("loc_N") declarations to the top of the function body so
     -- that nested closures created earlier in the body can reference them as
@@ -888,6 +915,7 @@ local function emitTopLevel(graph, structured)
         end
         w("local " .. table.concat(names, ", "))
     end
+    emitUndeclaredIndexedBaseInits(ctx, "", w)
 
     -- Hoist slot ("loc_N") declarations for the main function.
     do
